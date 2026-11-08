@@ -1,0 +1,17 @@
+{
+  "scene_id": "synthetic-cpu-fallback",
+  "gpu": {
+    "available": false,
+    "compute_capability": null,
+    "memory_total_mb": 0
+  },
+  "attention_installed": false,
+  "seed": 11,
+  "points": 300,
+  "batch_points": 512,
+  "memory_budget_mb": 512,
+  "prompt_rounds": [
+    {"clicks": 2},
+    {"clicks": 2}
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "interseg3d-ui-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browser-level tests for the interSeg3D-Studio frontend",
+  "scripts": {
+    "test": "playwright test",
+    "test:mock": "MOCK_BACKEND=1 playwright test",
+    "test:real": "MOCK_BACKEND=0 playwright test",
+    "report": "playwright show-report artifacts/report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.65.0"
+  }
+}

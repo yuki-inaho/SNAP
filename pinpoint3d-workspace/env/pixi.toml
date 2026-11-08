@@ -1,0 +1,53 @@
+[workspace]
+name = "pinpoint3d-cu118"
+description = "Isolated build env for PinPoint3D (torch 2.3.1 + CUDA 11.8) on RTX 2070 sm75"
+# NOTE: MinkowskiEngine 0.5.4 is intentionally NOT a pixi dependency.  It has no
+# compatible wheel for torch 2.3.1/CUDA 11.8 and must be compiled from the
+# pinned NVIDIA source by `bash ../build_minkowski.sh` (see README).  Everything
+# else, including the Studio backend, is locked in pixi.lock.
+channels = ["pytorch", "nvidia", "conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.10.*"
+pytorch = "==2.3.1"
+pytorch-cuda = "11.8.*"
+cuda-version = "11.8"
+# Pin the individual 11.8 packages: the cuda-toolkit meta resolves to a mixed
+# 11.8/12.4 stack on the nvidia channel, which breaks MinkowskiEngine.
+cuda-nvcc = "11.8.*"
+cuda-cudart-dev = "11.8.*"
+libcublas-dev = "11.11.3.6"
+libcublas = "11.11.3.6"
+libcusparse-dev = "11.7.5.86"
+libcusparse = "11.7.5.86"
+cuda-cccl = "11.8.*"
+gcc_linux-64 = "11.*"
+gxx_linux-64 = "11.*"
+numpy = "1.26.*"
+scipy = "1.11.*"
+openblas = "*"
+ninja = "*"
+cmake = "*"
+pip = "*"
+setuptools = "69.*"
+
+[pypi-dependencies]
+open3d = "==0.18.0"
+plyfile = "==1.1"
+tqdm = "*"
+pyyaml = "*"
+
+# Interactive backend (interSeg3D-Studio/src/backend).  Pinned to the versions
+# validated for the real upload/infer/export run, so they are recreated by
+# `pixi install` rather than relying on ad-hoc pip installs.
+fastapi = "==0.162.2"
+uvicorn = { version = "==0.54.0", extras = ["standard"] }
+pydantic-settings = "==2.15.0"
+python-multipart = "==0.0.32"
+aiofiles = "==25.1.0"
+Pillow = "==12.3.0"
+python-dotenv = "==1.2.4"
+httpx = "==0.28.1"
+# Optional recognition client (disabled at runtime unless a key is set).
+openai = "==3.46.0"

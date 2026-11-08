@@ -1,0 +1,4 @@
+interface:
+  display_name: "Point-cloud ML in Pixi GPU GUI tests"
+  short_description: "Split fake-model GUI tests from bounded real-model GPU smoke runs"
+  default_prompt: "Add point-cloud model inference coverage to this Pixi GPU GUI test suite."

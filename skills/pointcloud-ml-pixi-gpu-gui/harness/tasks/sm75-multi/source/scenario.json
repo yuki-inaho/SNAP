@@ -1,0 +1,18 @@
+{
+  "scene_id": "synthetic-sm75-multi",
+  "gpu": {
+    "available": true,
+    "compute_capability": 7.5,
+    "memory_total_mb": 8192
+  },
+  "attention_installed": false,
+  "seed": 2070,
+  "points": 1200,
+  "batch_points": 512,
+  "memory_budget_mb": 6000,
+  "prompt_rounds": [
+    {"clicks": 2},
+    {"clicks": 1},
+    {"clicks": 3}
+  ]
+}

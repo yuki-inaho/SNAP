@@ -1,0 +1,38 @@
+[
+  {
+    "position": [
+      2.8424025,
+      1.3025417,
+      0.5630025
+    ],
+    "is_positive": true,
+    "note": "seat point on chair instance 13 (seg20 class 4)"
+  },
+  {
+    "position": [
+      2.897325277328491,
+      1.533718466758728,
+      0.19096481800079346
+    ],
+    "is_positive": false,
+    "note": "unlabeled clutter point inside the positive-only mask (scene instance -1)"
+  },
+  {
+    "position": [
+      3.126737594604492,
+      1.235136866569519,
+      0.8177172541618347
+    ],
+    "is_positive": false,
+    "note": "unlabeled clutter point inside the positive-only mask (scene instance -1)"
+  },
+  {
+    "position": [
+      3.0935661792755127,
+      1.3651659488677979,
+      0.6139562726020813
+    ],
+    "is_positive": false,
+    "note": "unlabeled clutter point inside the positive-only mask (scene instance -1)"
+  }
+]

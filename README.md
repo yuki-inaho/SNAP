@@ -41,44 +41,213 @@ This repo is the official project repository for the paper **SNAP: Towards Segme
 * [Nov 5, 2025] SNAP is accepted for Oral presentation at 3DV 2026.
 * [Oct 13, 2025] Preprint released.
 
+For a separate interactive workflow with native positive and negative prompts,
+see the [PinPoint3D annotation workspace](pinpoint3d-workspace/README.md).
+
 
 ## Installation
 
-For the full installation, run
+### Pixi environment (recommended)
+
+The repository ships a locked [Pixi](https://pixi.sh) workspace (`pixi.toml` +
+`pixi.lock`). It pins Python 3.10, PyTorch 2.4.1 with CUDA 12.4, the matching
+PyG extensions, spconv, CLIP, Open3D, PyVista/VTK and PyQt6, so the CUDA and
+PyTorch-extension ABI stay consistent.
+
+Requirements:
+- Linux x86_64 with an NVIDIA GPU and driver (validated on RTX 2070 / sm75,
+  driver 580.178.04 reporting CUDA 13.0; only the CUDA 12.4 *runtime* is used)
+- [Pixi](https://pixi.sh) 0.79 or newer
+- [just](https://github.com/casey/just) is optional but convenient
+
+```shell
+git clone <repo-url> SNAP
+cd SNAP
+pixi install --locked
+```
+
+Verify the environment:
+
+```shell
+pixi run python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+# or, with just:
+just gpu          # Python / PyTorch / CUDA / GPU versions
+just imports      # import model, dataset and GUI modules
+just validate     # CUDA matmul, torch-scatter, torch-cluster and a spconv kernel
+just model-smoke  # build SNAP on the GPU (attention backend chosen automatically)
+```
+
+Run commands inside the environment with `pixi run <command>`, or open a shell
+with `pixi shell`. The justfile wraps the common workflows:
+
+```shell
+just            # list recipes
+just install    # pixi install --locked
+just test       # non-GUI pytest
+just test-gui   # point picking and segmentation UI logic
+just test-gui-qt # real Qt/VTK widgets under Xvfb
+just test-all   # all three suites, in separate processes
+just test-attention # attention backend and chunking regression checks
+just verify-inference # pretrained GPU inference on a labelled ScanNet sample
+just benchmark-precision # compare FP32 and mixed FP16 on the same prompts
+just demo data_examples/ScanNet/scene0011_00 Indoor
+```
+
+`just test` runs the non-GUI tests, `just test-gui` checks the GUI interaction
+logic, and `just test-gui-qt` exercises actual Qt/VTK widgets using `xvfb-run`.
+Install Xvfb on the host to run the latter. `just test-all` runs all three in
+separate processes to isolate Qt/VTK and CUDA state.
+
+### GPU compatibility and FlashAttention-2
+
+SNAP's backbone can use FlashAttention-2 on Ampere/Ada/Hopper (sm80+).
+FlashAttention-2 does **not** support Turing (sm75, e.g. RTX 2070), so
+`flash-attn` is deliberately **not** installed by default. The model selects
+its attention backend automatically:
+
+```shell
+# auto (default): FlashAttention-2 when available, otherwise PyTorch attention
+# flash: require FlashAttention-2 and fail loudly if it is unavailable
+# normal: force the PyTorch attention fallback
+export SNAP_ATTENTION_BACKEND=auto   # or flash / normal
+```
+
+On an sm80+ GPU you can install the optional build (it is not part of the
+default lock):
+
+```shell
+just install-flash
+```
+
+The recipe refuses to run on Turing and points at the fallback instead. The
+fallback computes attention in patches and can use more memory than FlashAttention;
+the full SNAP-C Outdoor demo (KITTI) ran on the 8 GB RTX 2070 with about 1.5 GB
+peak allocated CUDA memory. FlashAttention and the fallback have not been
+compared on this machine, which cannot run the former.
+
+The fallback limits the size of each attention chunk to 256 MiB by default.
+For lower peak memory, set the budget in bytes before launching the demo:
+
+```shell
+SNAP_ATTN_CHUNK_BYTES=67108864 just demo data_examples/ScanNet/scene0011_00 Indoor
+```
+
+The limit applies to an attention tensor, not the whole model's memory usage.
+
+### Opt-in FP16 inference
+
+FP16 is opt-in; FP32 remains the default for both entry points.
+
+```shell
+# Interactive GUI (default is fp32)
+pixi run python iterative_gui_demo.py --pc_path data_examples/ScanNet/scene0011_00 \
+    --domain Indoor --resume checkpoints/SNAP_C.pth --precision fp16
+
+# Same through the justfile: the fifth positional argument is the precision.
+just demo data_examples/ScanNet/scene0011_00 Indoor 0.02 checkpoints/SNAP_C.pth fp16
+
+# Recommended memory setting on the 8 GB RTX 2070: FP16 plus a 64 MiB
+# attention budget.
+just demo-lowmem data_examples/ScanNet/scene0011_00 Indoor 0.02
+```
+
+```python
+from python_demo import SegmentationModel
+
+model = SegmentationModel(
+    checkpoint_path="checkpoints/SNAP_C.pth",
+    domain="Indoor",
+    grid_size=0.02,
+    precision="fp16",  # default: "fp32"
+)
+```
+
+`precision="fp16"` (CLI: `--precision fp16`) enables CUDA autocast around the
+backbone, the mask decoder and the CLIP text encoder. It does **not** call
+`model.half()`: model parameters stay FP32, and coordinate/feature
+preprocessing, prompt handling, text matching, mask/IoU post-processing and
+cached text tokens are kept in FP32. `AutocastSafeSubMConv3d` keeps sparse
+submanifold convolutions in FP32 because spconv 2.3.6 has no FP16 algorithm for
+some of them on Turing. FP16 is rejected with a clear error on CPU, other
+non-CUDA devices and CUDA devices below compute capability 5.3; use FP32 there.
+
+Measured with the real `SNAP_C.pth`, ScanNet `scene0011_00`, grid size 0.02 and
+one prompt on the RTX 2070 (8 GB, sm75, PyTorch attention fallback). The GUI
+row includes model construction and the initial backbone pass; the API row is
+the backbone/segment path after the model is loaded.
+
+| setting | GUI startup + backbone peak | GUI click-flow peak | API backbone peak |
+|---|---:|---:|---:|
+| FP32, 64 MiB chunk | 1706.9 MiB | 1422.7 MiB | 1706.9 MiB |
+| FP16, 64 MiB chunk | 1393.3 MiB | 1384.3 MiB | 1393.3 MiB |
+| FP32, default chunk (256 MiB) | 1915.5 MiB | 1422.7 MiB | - |
+| FP16, default chunk (256 MiB) | 1962.9 MiB | 1384.3 MiB | - |
+
+The smaller attention budget was required for the memory reduction here: with
+the default chunk FP16 was slightly higher than FP32 in this run. A prior
+model-only benchmark on the same scene and three prompts measured
+1368.2 MiB (FP32) versus 1063.4 MiB (FP16) with the 64 MiB chunk, and
+1576.7 MiB versus 1610.8 MiB with the default chunk. All reported runs produced
+finite, non-empty masks and kept every parameter in FP32. The GUI runs were
+driven by a real Qt right-click on a cloud point.
+
+These are single-scene, single-GPU measurements, not a general quality claim.
+The same API prompt produced 6389 mask points with FP16 and 6902 with FP32;
+mean mask IoU against FP32 was 0.9961 over three prompts in the prior benchmark.
+Validate FP16 on the target data before relying on it. The interactive demo
+still defaults to FP32.
+
+
+### PyTorch extension compatibility
+
+`torch-scatter 2.1.2` and `torch-cluster 1.6.3` come from the `pyg` channel and
+are built against `torch 2.4.0 + cu124`. They are ABI-compatible with the pinned
+`torch 2.4.1 + cu124`, but they are **not** compatible with a different torch or
+CUDA major/minor line. If you change `pytorch` in `pixi.toml`, update the PyG
+builds at the same time, then re-run:
+
+```shell
+just lock
+just install
+just validate
+```
+
+`spconv-cu120 2.3.6` is a prebuilt wheel that includes sm70/sm75/sm80/sm86/sm89
+kernels, so it works on Turing as well as newer GPUs. `numpy` is pinned below 2
+because the older model and dataset code expects the NumPy 1.x ABI.
+
+### Legacy conda environment
+
+`environment.yaml` is kept for reference and for reproducing the original
+paper environment. It is not required for the Pixi workflow above.
+
 ```shell
 conda env create -f environment.yaml
 conda activate Lidar_Seg
 ```
 
-For barebones setup, we'll need atleast the following packages:
-```shell
-conda create -n Lidar_Seg python==3.10
-conda activate Lidar_Seg
-conda install pytorch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 pytorch-cuda=12.4 -c pytorch -c nvidia
-python -m pip install flash-attn --no-build-isolation
-conda install h5py pyyaml -c anaconda -y
-conda install tensorboard tensorboardx addict einops scipy plyfile timm hdbscan -c conda-forge -y
-conda install pytorch-cluster pytorch-scatter -c pyg -y
-python -m pip install spconv-cu120
-python -m pip install torch-geometric python-dateutil nuscenes-devkit
-conda install pandas
-python -m pip install git+https://github.com/openai/CLIP.git
-python -m pip install pyvista open3d
-python -m pip install PyQt6 pyvistaqt
-```
+The old barebones instructions installed `flash-attn` unconditionally and
+therefore fail on Turing GPUs; use the Pixi environment and the attention
+fallback instead.
 
 ## Interactive Demo
 Download the SNAP-C checkpoint from [here](#checkpoints) into a “checkpoints/” folder in the current working directory.
 ```shell
-python iterative_gui_demo.py --pc_path <path to point cloud files> --domain <domain> --resume <path to model checkpoint>
+pixi run python iterative_gui_demo.py --pc_path <path to point cloud files> --domain <domain> --resume <path to model checkpoint>
 ```
 
 Examples for the provided point cloud files:
 ```shell
-python iterative_gui_demo.py --pc_path data_examples/S3DIS/conferenceRoom_1/ --domain Indoor --resume checkpoints/SNAP_C.pth
-python iterative_gui_demo.py --pc_path data_examples/ScanNet/scene0011_00 --domain Indoor --resume checkpoints/SNAP_C.pth
-python iterative_gui_demo.py --pc_path data_examples/KITTI/000000.bin  --domain Outdoor --resume checkpoints/SNAP_C.pth
-python iterative_gui_demo.py --pc_path data_examples/nuScenes/example_3.pcd.bin --domain=Outdoor --resume checkpoints/SNAP_C.pth
+pixi run python iterative_gui_demo.py --pc_path data_examples/S3DIS/conferenceRoom_1/ --domain Indoor --resume checkpoints/SNAP_C.pth
+pixi run python iterative_gui_demo.py --pc_path data_examples/ScanNet/scene0011_00 --domain Indoor --resume checkpoints/SNAP_C.pth
+pixi run python iterative_gui_demo.py --pc_path data_examples/KITTI/000000.bin  --domain Outdoor --resume checkpoints/SNAP_C.pth
+pixi run python iterative_gui_demo.py --pc_path data_examples/nuScenes/example_3.pcd.bin --domain=Outdoor --resume checkpoints/SNAP_C.pth
+```
+
+The same demo through the justfile:
+```shell
+just demo data_examples/KITTI/000000.bin Outdoor 0.05
+just demo data_examples/ScanNet/scene0011_00 Indoor 0.02
 ```
 
 Once the demo is launched, it'll load the pointcloud in a visualization window, you can segment objects using following steps:
@@ -89,10 +258,11 @@ Once the demo is launched, it'll load the pointcloud in a visualization window, 
 
 If you want to visualize the results on the complete data (if you have the full dataset), set the data_root parameter in the config file of the respective dataset and run 
 ```shell
-torchrun --nproc_per_node=1 vis_all.py --distributed --use_pdnorm --resume checkpoints/SNAP_C.pth --stage scannet --iterative --enable_amp
+pixi run torchrun --nproc_per_node=1 vis_all.py --distributed --use_pdnorm --resume checkpoints/SNAP_C.pth --stage scannet --iterative --enable_amp
 ```
 
 ## Python Snippets to run the model
+Run the snippet inside the environment (`pixi run python` or `pixi shell`):
 ```shell
 # Import the required libraries
 from python_demo import PointCloudData, SegmentationModel
@@ -102,7 +272,7 @@ point_cloud = PointCloudData()
 point_cloud_data = point_cloud.load_point_cloud("data_examples/KITTI/000000.bin")
 
 # Load the model
-model = SegmentationModel(checkpoint_path="/home/thor/Projects/Lidar_Segmentation/checkpoints/SNAP_aerial_outdoor_indoor_epoch_19.pth", domain="Outdoor", grid_size=0.05)
+model = SegmentationModel(checkpoint_path="checkpoints/SNAP_C.pth", domain="Outdoor", grid_size=0.05)
 
 # Intialize the model and run the model backbone to extract point features
 point_cloud_data = model.intialize_pointcloud(point_cloud_data)
@@ -148,12 +318,22 @@ We provide the following checkpoints -
 
 ### Scripts
 ```shell
-torchrun --nproc_per_node=1 main.py --distributed --use_pdnorm --resume <path to checkpoint to resume from> --stage <datasets you want to train on> --iterative --enable_amp --use_localized_loss --use_aux_loss --use_random_clicks --use_pdnorm 
+pixi run torchrun --nproc_per_node=1 main.py --distributed --use_pdnorm --resume <path to checkpoint to resume from> --stage <datasets you want to train on> --iterative --enable_amp --use_localized_loss --use_aux_loss --use_random_clicks --use_pdnorm
+```
+
+or with `just` (arguments are forwarded unchanged):
+```shell
+just train --distributed --use_pdnorm --stage scannet --iterative --enable_amp
 ```
 
 ## Evaluation
 ```shell
-torchrun --nproc_per_node=1 main.py --exp_name <experiment_name> --stage <dataset_name> --compute_NOC --enable_amp --use_pdnorm --distributed --batch_size=1 --num_workers=8 --num_prompt_points=20 --num_object_chunk=16 --iterative --use_centroid --val_only --resume checkpoints/SNAP_C.pth
+pixi run torchrun --nproc_per_node=1 main.py --exp_name <experiment_name> --stage <dataset_name> --compute_NOC --enable_amp --use_pdnorm --distributed --batch_size=1 --num_workers=8 --num_prompt_points=20 --num_object_chunk=16 --iterative --use_centroid --val_only --resume checkpoints/SNAP_C.pth
+```
+
+or with `just` (adds `--val_only` automatically):
+```shell
+just eval --exp_name <experiment_name> --stage <dataset_name> --compute_NOC --enable_amp --use_pdnorm --distributed --batch_size=1 --num_workers=8 --num_prompt_points=20 --num_object_chunk=16 --iterative --use_centroid --resume checkpoints/SNAP_C.pth
 ```
 
 Note that use_centroid flag enables the use of centroid prompts during evaluation and val_only flag runs only the validation loop.

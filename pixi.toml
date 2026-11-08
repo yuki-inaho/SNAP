@@ -1,0 +1,83 @@
+[workspace]
+name = "snap"
+description = "SNAP: Towards Segmenting Anything in Any Point Cloud (3DV 2026)"
+channels = ["pyg", "pytorch", "nvidia", "conda-forge"]
+# CUDA 12.4 runtime virtual package: the host driver may be newer (CUDA 13.0
+# here), but PyTorch and the PyG wheels are built for CUDA 12.4.
+platforms = [{ name = "linux-64-cuda-12-4", platform = "linux-64", cuda = "12.4" }]
+
+[dependencies]
+python = "3.10.*"
+
+# PyTorch / CUDA stack.  torch 2.4.1 + cu124 matches the PyG wheels below.
+pytorch = "==2.4.1"
+pytorch-cuda = "12.4.*"
+torchvision = "==0.19.1"
+
+# PyG extensions: the pyg channel builds these against torch 2.4.0 / cu124, which
+# is ABI-compatible with torch 2.4.1.  Do not upgrade torch without reinstalling.
+pytorch-scatter = "==2.1.2"
+pytorch-cluster = "==1.6.3"
+
+# Core scientific / model stack (see environment.yaml for the original versions).
+numpy = "1.26.*"
+scipy = "1.14.*"
+h5py = "3.11.*"
+pandas = "2.2.*"
+# nuscenes-devkit 1.1.11 requires matplotlib <3.6; keep the original 3.5 line.
+# Use matplotlib-base (no conda PyQt5 backend) because the GUI uses PyQt6 from pip.
+matplotlib-base = "3.5.*"
+# Keep pillow on the 9.4 line: the pytorch channel's libjpeg-turbo 2.1.5 is
+# selected under strict channel priority and newer pillow builds need >=3.
+pillow = "9.4.*"
+scikit-learn = "1.5.*"
+shapely = "1.8.*"
+tqdm = "4.66.*"
+pyyaml = "6.0.*"
+python-dateutil = "2.9.*"
+
+# Model / training dependencies.
+addict = "2.4.*"
+einops = "0.8.*"
+timm = "==1.0.9"
+plyfile = "1.1.*"
+hdbscan = "0.8.*"
+tensorboard = "2.18.*"
+tensorboardx = "2.6.*"
+
+# Test tooling (tests/), including Qt/VTK widget tests.
+pytest = "8.*"
+pytest-qt = "4.*"
+psutil = "6.*"
+
+# pip build helpers for the optional FlashAttention feature.
+setuptools = ">=70"
+wheel = "*"
+pip = "24.*"
+
+[pypi-dependencies]
+# spconv 2.3.6 wheel is built for CUDA 12.0 and contains sm70/sm75/sm80/sm86/sm89
+# kernels, so it works on Turing (RTX 2070) as well as Ampere+.
+spconv-cu120 = "==2.3.6"
+torch-geometric = "==2.6.1"
+nuscenes-devkit = "==1.1.11"
+
+# GUI: PyQt6 is imported by iterative_gui_demo.py; pyvistaqt embeds VTK in Qt.
+# VTK/pyvista come from PyPI because the pytorch channel torchvision pins
+# libjpeg-turbo <3, which conflicts with the conda-forge VTK 9.3 builds; the
+# PyPI VTK wheel bundles its own libraries.
+open3d = "==0.18.0"
+pyvista = "==0.44.1"
+vtk = "==9.3.1"
+pyvistaqt = "==0.11.3"
+PyQt6 = "==6.7.1"
+
+# OpenAI CLIP is not on PyPI under this name; install it from the pinned commit.
+clip = { git = "https://github.com/openai/CLIP.git", rev = "d05afc436d78f1c48dc0dbf8e5980a9d471f35f6" }
+
+# Optional FlashAttention-2 is intentionally not part of the lock: flash-attn
+# 2.x only supports sm80+ (Ampere/Ada/Hopper), not Turing (sm75).  `just
+# install-flash` builds it into this environment on supported GPUs only.
+
+[environments]
+default = { solve-group = "default" }

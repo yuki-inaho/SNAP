@@ -1,0 +1,118 @@
+# PinPoint3D workspace commands.
+#
+# Run from this directory:  just
+# The isolated CUDA 11.8 environment lives in env/ (see env/pixi.toml).
+# MinkowskiEngine is the one source-built exception; `just minkowski`.
+
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+default:
+    @just --list
+
+# Clone pinned upstream sources and apply the Studio changes.
+bootstrap:
+    bash bootstrap.sh
+
+# Generate the sample upload PLY from the bundled ScanNet arrays.
+sample-ply:
+    env/.pixi/envs/default/bin/python scripts/sample_ply.py --data ../data_examples/ScanNet/scene0025_00 --out outputs/ply/scene0025_00.ply
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+
+# Create/refresh the locked environment (torch 2.3.1 + CUDA 11.8 + backend deps).
+install:
+    cd env && pixi install --locked
+
+# Re-solve and refresh env/pixi.lock after editing env/pixi.toml.
+lock:
+    cd env && pixi lock
+
+# Verify the locked environment really has torch, MinkowskiEngine and the API stack.
+env-check:
+    env/.pixi/envs/default/bin/python -c 'import torch, MinkowskiEngine as ME; import fastapi, uvicorn, pydantic_settings, multipart, aiofiles, open3d; print("torch", torch.__version__, "cuda", torch.version.cuda); print("MinkowskiEngine", ME.__version__); print("backend deps OK")'
+
+# Rebuild MinkowskiEngine 0.5.4 from the pinned NVIDIA source (documented exception; no wheel for torch 2.3.1/CUDA 11.8).
+minkowski:
+    bash build_minkowski.sh
+
+# ---------------------------------------------------------------------------
+# Real batch inference (raw masks, no click forcing)
+# ---------------------------------------------------------------------------
+
+# Run every prompt configuration and write logs to outputs/logs.
+run-all:
+    bash run_all.sh
+
+# One run: just infer <prompt.json> <output-dir>
+infer prompt out:
+    env/.pixi/envs/default/bin/python scripts/pinpoint3d_run.py \
+      --data ../data_examples/ScanNet/scene0025_00 \
+      --checkpoint weights/pinpoint3d_pretrained.pth \
+      --instance 13 --prompts {{quote(prompt)}} --out {{quote(out)}}
+
+# Re-render the before/after and negative-click sensitivity figures.
+figures:
+    env/.pixi/envs/default/bin/python scripts/render_compare.py \
+      --runs outputs/pos1 outputs/pos1_neg_fp1 outputs/pos1_neg_fp3 \
+      --titles "positive only" "1 negative (clutter)" "3 negatives (over-suppressed)" \
+      --out outputs/sensitivity_negative_clicks.png
+
+# ---------------------------------------------------------------------------
+# Real interactive backend + API validation
+# ---------------------------------------------------------------------------
+
+# Start the FastAPI backend on 127.0.0.1:9502 (foreground; Ctrl-C to stop).
+backend:
+    bash scripts/start_backend.sh
+
+# Health probe for the running backend.
+health:
+    curl -sS http://127.0.0.1:9502/health
+
+# Upload the bundled scene, run positive-only and positive+negative inference, download both exports, write evidence.json.
+validate-backend:
+    env -u GEMINI_API_KEY -u GOOGLE_API_KEY -u ARK_API_KEY \
+      env/.pixi/envs/default/bin/python scripts/validate_backend.py \
+      --base-url http://127.0.0.1:9502 \
+      --ply outputs/ply/scene0025_00.ply \
+      --out outputs/api_validation
+
+# ---------------------------------------------------------------------------
+# Interactive frontend + browser E2E
+# ---------------------------------------------------------------------------
+
+# Install the frontend exactly from its lockfile (no global npm changes).
+frontend-install:
+    cd interSeg3D-Studio/src/frontend && npm ci
+
+# Dev server on 127.0.0.1:3001, proxying /api to the real backend on 9502.
+frontend:
+    cd interSeg3D-Studio/src/frontend && VITE_USE_PROXY=true VITE_API_BASE_URL=http://127.0.0.1:9502 npx vite --host 127.0.0.1 --port 3001
+
+# Install the Playwright test harness (system Chrome, no browser download).
+ui-test-install:
+    cd ui-tests && npm ci
+
+# Real-backend browser test: upload -> positive click -> negative click -> infer -> export.
+# Artifacts go to a separate directory so an existing final-real evidence set is never overwritten.
+ui-test:
+    cd ui-tests && BASE_URL=http://127.0.0.1:3001 MOCK_BACKEND=0 CUBE_SIZE=0.02 SAMPLE_PLY=../outputs/ply/scene0025_00.ply ARTIFACT_DIR=artifacts/just-ui-test npx playwright test
+
+# Same UI path against the clearly-labelled deterministic mock (not model inference).
+ui-test-mock:
+    cd ui-tests && BASE_URL=http://127.0.0.1:3001 MOCK_BACKEND=1 ARTIFACT_DIR=artifacts/run npx playwright test
+
+# Regression test: export metadata object/part ids, colours, negative-click flags.
+test-metadata:
+    env/.pixi/envs/default/bin/python scripts/test_export_metadata.py
+
+# ---------------------------------------------------------------------------
+# Static check
+# ---------------------------------------------------------------------------
+
+# Byte-compile the local scripts and flag whitespace errors.
+check: test-metadata
+    env/.pixi/envs/default/bin/python -m compileall -q scripts
+    git diff --check -- .

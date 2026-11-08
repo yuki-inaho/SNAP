@@ -5,7 +5,7 @@ import numpy as np
 from .prompt_encoder import PositionEmbeddingCoordsSine
 from .merge import Merge
 from .losses.arch_sam_loss_weighted import loss_ce, loss_dice, loss_focal, loss_text, loss_iou
-from .ptv3_backbone_domain import PointTransformerV3
+from .ptv3_backbone_domain import PointTransformerV3, resolve_attention_backend
 
 class InputEncoder(nn.Module):
     def __init__(self, out_channels = 10):
@@ -66,7 +66,21 @@ class InputEncoder(nn.Module):
 
 class SNAP(nn.Module):
     def __init__(self, num_points=32, num_merge_blocks=1, mask_threshold=0.5, 
-                    pretrained_weights_path=None, use_pdnorm=False, use_aux_loss=False, use_localized_loss=False, return_mid_points=False):
+                    pretrained_weights_path=None, use_pdnorm=False, use_aux_loss=False, use_localized_loss=False, return_mid_points=False,
+                    attention_backend=None, attention_device=None):
+        """SNAP segmentation model.
+
+        ``attention_backend`` selects the backbone attention implementation:
+        ``"auto"`` (default, also settable with ``SNAP_ATTENTION_BACKEND``) uses
+        FlashAttention-2 when the installed package and CUDA devices support it
+        and otherwise falls back to regular PyTorch attention; ``"flash"``
+        requires FlashAttention-2; ``"normal"`` forces the fallback.
+
+        ``attention_device`` optionally pins the capability check to a specific
+        CUDA device (for example ``"cuda:1"``).  By default every visible CUDA
+        device is checked, so the resolved backend stays valid if the model is
+        moved to another visible GPU.
+        """
         super().__init__()
         
         out_channels = 10
@@ -75,11 +89,19 @@ class SNAP(nn.Module):
         self.w_max = 2
         self.w_min = 1
 
+        # Resolve attention backend before building the backbone. On unsupported
+        # devices (for example RTX 2070 / Turing sm75) "auto" falls back to the
+        # regular PyTorch attention implementation.
+        self.attention_backend = resolve_attention_backend(
+            attention_backend, attention_device
+        )
+
         # Define the input encoder
         self.input_encoder = InputEncoder(out_channels=out_channels)
 
         # Define the backbone
-        self.backbone = PointTransformerV3(in_channels=out_channels*4, enable_flash=True, 
+        self.backbone = PointTransformerV3(in_channels=out_channels*4,
+                                            enable_flash=(self.attention_backend == "flash"),
                                             pdnorm_bn=use_pdnorm, pdnorm_ln=use_pdnorm, return_mid_points=return_mid_points)
         backbone_out_channels = self.backbone.backbone_out_channels
 

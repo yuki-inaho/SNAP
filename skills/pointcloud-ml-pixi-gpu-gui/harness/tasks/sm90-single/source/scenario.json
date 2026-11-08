@@ -1,0 +1,16 @@
+{
+  "scene_id": "synthetic-sm90-single",
+  "gpu": {
+    "available": true,
+    "compute_capability": 9.0,
+    "memory_total_mb": 24576
+  },
+  "attention_installed": true,
+  "seed": 90,
+  "points": 4096,
+  "batch_points": 4096,
+  "memory_budget_mb": 8192,
+  "prompt_rounds": [
+    {"clicks": 1}
+  ]
+}

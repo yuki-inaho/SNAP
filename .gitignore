@@ -4,3 +4,16 @@ dev_logs/
 dev_checkpoints/
 *.pyc
 __pycache__/
+.pixi/
+.serena/
+
+# Local environments, upstream checkouts, models, and generated results.
+outputs/
+pinpoint3d-workspace/PinPoint3D/
+pinpoint3d-workspace/interSeg3D-Studio/
+pinpoint3d-workspace/MinkowskiEngine/
+pinpoint3d-workspace/weights/
+pinpoint3d-workspace/outputs/
+pinpoint3d-workspace/ui-tests/node_modules/
+pinpoint3d-workspace/ui-tests/artifacts/
+pinpoint3d-workspace/ui-tests/test-results/

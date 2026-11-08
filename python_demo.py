@@ -1,99 +1,122 @@
 import torch
 import torch.nn.functional as F
 import argparse
+import contextlib
 import os
 from src.snap import SNAP 
 from utils.torch_helpers import all_to_device
 from datasets.demo import DemoDatset
 import numpy as np
 import pyvista as pv
-import open3d as o3d
 import clip
 import pdb
-import pandas as pd
 import hdbscan
 
+from pointcloud_loader import load_point_cloud as load_point_cloud_file
+
+PRECISION_CHOICES = ("fp32", "fp16")
+# FP16 CUDA kernels are available from compute capability 5.3 onwards.
+_FP16_MIN_COMPUTE_CAPABILITY = (5, 3)
+
+
+def normalize_precision(precision):
+    """Return the canonical precision name, rejecting unknown values."""
+
+    value = "fp32" if precision is None else str(precision).strip().lower()
+    if value not in PRECISION_CHOICES:
+        raise ValueError(
+            f"Unsupported precision {precision!r}; expected one of "
+            f"{PRECISION_CHOICES}."
+        )
+    return value
+
+
+def resolve_precision(precision, device):
+    """Validate an inference precision for ``device``.
+
+    ``fp32`` is valid everywhere.  ``fp16`` means CUDA autocast, so it is
+    deliberately rejected on CPU and other backends instead of silently
+    running a different (or emulated) precision.
+    """
+
+    value = normalize_precision(precision)
+    device = torch.device(device)
+    if value == "fp16":
+        if device.type != "cuda":
+            raise RuntimeError(
+                "precision='fp16' requires a CUDA device; "
+                f"got device type {device.type!r} ({device}). "
+                "Use precision='fp32' for CPU inference."
+            )
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "precision='fp16' requires CUDA, but torch.cuda.is_available() "
+                "is False. Use precision='fp32' for CPU inference."
+            )
+        capability = torch.cuda.get_device_capability(device)
+        if capability < _FP16_MIN_COMPUTE_CAPABILITY:
+            raise RuntimeError(
+                "precision='fp16' is not supported on CUDA compute capability "
+                f"{capability[0]}.{capability[1]}; at least 5.3 is required. "
+                "Use precision='fp32'."
+            )
+    return value
+
+
+@contextlib.contextmanager
+def precision_autocast(device, precision):
+    """Autocast context for model inference.
+
+    The model stays in FP32: only the operations that CUDA autocast supports
+    run in FP16.  Coordinate preprocessing and FP32 model parameters are never
+    converted by this helper.  CPU (and any non-CUDA device) must use
+    ``fp32``; asking for ``fp16`` there raises a clear error.
+    """
+
+    value = resolve_precision(precision, device)
+    if value == "fp32":
+        yield
+        return
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        yield
+
+
 class PointCloudData:
-    def __init__(self):
+    """Thin wrapper around :func:`pointcloud_loader.load_point_cloud`.
+
+    Kept as a class so that the snippet documented in ``README.md`` keeps
+    working unchanged.
+    """
+
+    def __init__(self, trust_pickle: bool = True):
         self.points = None  # Initialize without points
+        self.trust_pickle = trust_pickle
 
     def load_point_cloud(self, filename):
-        data = {}
-        # Load the point cloud from the temporary file
-        if filename.lower().endswith('.ply'):
-            pcd = o3d.io.read_point_cloud(filename)
-        elif filename.lower().endswith('.pcd'):
-            pcd = o3d.io.read_point_cloud(filename)
-        elif filename.lower().endswith('.pcd.bin'): # Nuscenes format
-            pcdata = np.fromfile(filename, dtype=np.float32, count=-1)
-            pcdata = pcdata.reshape(-1, 5)
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(pcdata[:, :3])
-            data["intensity"] = pcdata[:, 3].reshape(-1, 1)/255.0
-        elif filename.lower().endswith('.bin'): # Kitti format
-            pcdata = np.fromfile(filename, dtype=np.float32)
-            pcdata = pcdata.reshape(-1, 4)
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(pcdata[:, :3])
-            data["intensity"] = pcdata[:, 3].reshape(-1, 1)
-            print("Intensity data found")
-            print("Min and max are: ", data["intensity"].min(), data["intensity"].max())
-        elif filename.lower().endswith('.pkl'): # Pandaset format
-            pcdata = pd.read_pickle(filename)
-            valid_idxs = np.where(pcdata.d==0)[0] # Get the points belonging to the 360 point cloud only
-            pcdata_points = np.asarray(pcdata.values[valid_idxs][:, :3])
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(pcdata_points)
-            data['intensity'] = np.expand_dims(np.asarray(pcdata.values[valid_idxs][:, 3])/255.0, 1)
-            print("Intensity data found")
-            print("Min and max are: ", data["intensity"].min(), data["intensity"].max())
-        elif filename.lower().endswith('.pth'):
-            pcdata = torch.load(filename)
-            coord = pcdata[0]
-            scale_mat = np.diag([0.1, 0.1, 0.1])
-            coord = coord @ scale_mat
-
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(coord)
-            data['color'] = pcdata[1]
-
-        else:
-            # Check if path is a directory
-            if os.path.isdir(filename):
-                # Check if the following files exist in the directory -> coords.npy, colors.npy, normals.npy
-                coord_path = os.path.join(filename, "coord.npy")
-                color_path = os.path.join(filename, "color.npy")
-                normal_path = os.path.join(filename, "normal.npy")
-
-                if os.path.exists(coord_path):
-                    coords = np.load(coord_path)
-                    pcd = o3d.geometry.PointCloud()
-                    pcd.points = o3d.utility.Vector3dVector(coords)
-                
-                if os.path.exists(color_path):
-                    colors = np.load(color_path)
-                    pcd.colors = o3d.utility.Vector3dVector(colors)
-                
-                if os.path.exists(normal_path):
-                    normals = np.load(normal_path)
-                    pcd.normals = o3d.utility.Vector3dVector(normals)
-     
-            else:
-                raise ValueError("Invalid file format. Supported formats are .ply, .pcd, .bin, .pcd.bin")
-
-
-        data["coord"] = np.asarray(pcd.points)
-        if np.asarray(pcd.colors).shape[0] > 0:
+        data = load_point_cloud_file(filename, trust_pickle=self.trust_pickle)
+        if "color" in data:
             print("Color data found")
-            data["color"] = np.asarray(pcd.colors) 
-        if np.asarray(pcd.normals).shape[0] > 0:
-            data["normal"] = np.asarray(pcd.normals) 
-
+        if "normal" in data:
+            print("Normal data found")
+        if "intensity" in data:
+            print("Intensity data found")
+            print("Min and max are: ", data["intensity"].min(), data["intensity"].max())
         return data
 
 class SegmentationModel:
-    def __init__(self, checkpoint_path=None, domain="Outdoor", grid_size=None):
+    """SNAP inference wrapper used by the Python snippet.
+
+    ``precision="fp32"`` is the default.  ``precision="fp16"`` enables CUDA
+    autocast for the backbone, mask decoder and CLIP text encoder without
+    converting model parameters; it is rejected on non-CUDA devices.
+    """
+
+    def __init__(self, checkpoint_path=None, domain="Outdoor", grid_size=None,
+                 precision="fp32"):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Validate before building the model so an unsupported request fails
+        # immediately and cannot leave a half-initialised model behind.
+        self.precision = resolve_precision(precision, self.device)
         self.domain = domain
 
         # Initialize the datset class
@@ -146,17 +169,19 @@ class SegmentationModel:
         data = all_to_device(data, self.device)
 
         with torch.no_grad():
-            # Run the input encoder
+            # Coordinate/feature preprocessing stays outside autocast and in
+            # FP32.  Only the backbone runs under the selected precision.
             data = self.model.run_input_encoder(data)
-
-            # Get the point features through model backbone
-            self.point_features, self.mid_points_features = self.model.run_backbone(data)
+            with precision_autocast(self.device, self.precision):
+                self.point_features, self.mid_points_features = self.model.run_backbone(data)
     
     def get_text_label(self, clip_token, pred_token, labels):
-        clip_token = F.normalize(clip_token, p=2, dim=1).to(torch.float32)
-        pred_token = F.normalize(pred_token, p=2, dim=1)
+        # Text matching and mask post-processing are done in FP32 regardless
+        # of the inference precision.
+        clip_token = F.normalize(clip_token.to(torch.float32), p=2, dim=1)
+        pred_token = F.normalize(pred_token.to(torch.float32), p=2, dim=1)
 
-        logits = pred_token @ clip_token.T
+        logits = (pred_token @ clip_token.T).float()
         # pdb.set_trace()
         pred_labels = torch.argmax(logits, dim=1)
         score = logits[0, pred_labels[0]].cpu().numpy()
@@ -220,10 +245,12 @@ class SegmentationModel:
             if text_prompt:
                 print(text_prompt)
                 tokenized_text_prompt = clip.tokenize(text_prompt).to(self.device)
-                text_features = self.clip_model.encode_text(tokenized_text_prompt)
+                with torch.no_grad(), precision_autocast(self.device, self.precision):
+                    text_features = self.clip_model.encode_text(tokenized_text_prompt).float()
 
             text_inputs_vocab = torch.cat([clip.tokenize(f"segment {c}") for c in self.dataset.labels]).to(self.device)
-            text_features_vocab = self.clip_model.encode_text(text_inputs_vocab)
+            with torch.no_grad(), precision_autocast(self.device, self.precision):
+                text_features_vocab = self.clip_model.encode_text(text_inputs_vocab).float()
 
             # Extract masks for each prompt
             data = all_to_device(data, self.device)
@@ -235,13 +262,15 @@ class SegmentationModel:
                     data_dict = data.copy()
                     data_dict["point"] = data['point'][i].unsqueeze(0)
 
-                    mask_logits, text_out, iou_out, _, _, _, _ = self.model.run_mask_decoder(self.point_features, data_dict)
-                    masks.append(mask_logits[0].sigmoid().squeeze().cpu().numpy() > 0.5)
+                    with precision_autocast(self.device, self.precision):
+                        mask_logits, text_out, iou_out, _, _, _, _ = self.model.run_mask_decoder(self.point_features, data_dict)
+                    # Mask and IoU post-processing is always FP32.
+                    masks.append(mask_logits[0].float().sigmoid().squeeze().cpu().numpy() > 0.5)
                    
                     # Get the text output
                     label, score = self.get_text_label(text_features_vocab, text_out[0], self.dataset.labels)
                     text_out_list.append(label)
-                    iou_out_list.append(iou_out[0][0].cpu().numpy())
+                    iou_out_list.append(iou_out[0][0].float().cpu().numpy())
                     print(f"Label: {label}, IOU: {iou_out[0]} Score: {score}")
 
         return masks, text_out_list, iou_out_list

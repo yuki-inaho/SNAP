@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "name": "pointcloud-gui-plan",
+  "domain": "gpu-gui-test-planning",
+  "base_harness": "base",
+  "tasks_dir": "tasks",
+  "task_prompt": "task.md",
+  "task_source": "source",
+  "executor": {
+    "argv": [
+      "python3",
+      "{manifest_dir}/tools/answer.py",
+      "--task",
+      "{task_dir}",
+      "--harness",
+      "{harness_dir}",
+      "--out",
+      "{run_dir}/answer.json"
+    ],
+    "answer": "answer.json",
+    "timeout_s": 60,
+    "model": "declared-python-planner"
+  },
+  "editor": {
+    "channel": "opencode",
+    "model": "ollama-cloud/deepseek-v4.1-flash:1017#high",
+    "steps": 30,
+    "timeout_s": 240,
+    "startup_timeout_s": 90,
+    "launcher": "service"
+  },
+  "judge": {
+    "argv": [
+      "python3",
+      "{manifest_dir}/tools/judge.py",
+      "--task",
+      "{task_dir}",
+      "--answer",
+      "{answer}"
+    ],
+    "timeout_s": 60
+  },
+  "prompts": {
+    "work": "repair the GPU GUI test planner in scripts/plan_gui_ml_test.py so it emits the contract in MISSION.md for the scenario in source/scenario.json",
+    "deliverable_word": "plan"
+  },
+  "leak_globs": [
+    "expected*",
+    "*.expected.json",
+    "judge.json",
+    "reference*"
+  ],
+  "obs_trunc": 20000
+}

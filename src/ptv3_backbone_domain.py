@@ -2,6 +2,8 @@ import sys
 from functools import partial
 from addict import Dict
 import math
+import os
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,14 +14,177 @@ from collections import OrderedDict
 
 try:
     import flash_attn
-except ImportError:
+    _FLASH_ATTN_IMPORT_ERROR = None
+except Exception as exc:  # optional dependency
     flash_attn = None
+    _FLASH_ATTN_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+
+# FlashAttention-2 only ships kernels for Ampere (sm80) and newer GPUs.
+FLASH_ATTENTION_MIN_COMPUTE_CAPABILITY = (8, 0)
+_FLASH_ATTENTION_WARNINGS = set()
+
+
+def _cuda_device_indices(device=None):
+    """Resolve a device specification to CUDA indices to validate.
+
+    ``None`` means every visible CUDA device.  This conservative default keeps
+    a model usable if it is constructed on CPU or moved to another visible GPU
+    after construction.  Pass an explicit device to check only that device.
+    """
+    if not torch.cuda.is_available():
+        return []
+    if device is None:
+        return list(range(torch.cuda.device_count()))
+    if isinstance(device, torch.device):
+        if device.type != "cuda":
+            return []
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        return [index]
+    if isinstance(device, int):
+        return [device]
+    if isinstance(device, str):
+        if not device.startswith("cuda"):
+            return []
+        if ":" in device:
+            return [int(device.split(":")[-1])]
+        return [torch.cuda.current_device()]
+    return []
+
+
+def get_flash_attention_status(device=None):
+    """Return ``(available, reason)`` for FlashAttention-2 on ``device``.
+
+    ``available`` is True only when the flash_attn package exposes the
+    FlashAttention-2 API and every selected CUDA device has compute capability
+    >= 8.0.  Turing (sm75) and older GPUs intentionally report False so that
+    callers can fall back to the regular PyTorch attention path.
+    """
+    if flash_attn is None:
+        reason = "flash_attn is not installed"
+        if _FLASH_ATTN_IMPORT_ERROR:
+            reason += f" ({_FLASH_ATTN_IMPORT_ERROR})"
+        return False, reason
+    if not hasattr(flash_attn, "flash_attn_varlen_qkvpacked_func"):
+        return False, "flash_attn does not provide the FlashAttention-2 varlen API"
+    version = getattr(flash_attn, "__version__", None)
+    if version is not None:
+        try:
+            if int(str(version).split(".")[0]) < 2:
+                return False, f"flash_attn {version} is not FlashAttention-2"
+        except (TypeError, ValueError):
+            pass
+
+    device_indices = _cuda_device_indices(device)
+    if not device_indices:
+        return False, "CUDA is not available"
+    unsupported = []
+    device_names = []
+    for device_index in device_indices:
+        try:
+            capability = torch.cuda.get_device_capability(device_index)
+            device_name = torch.cuda.get_device_name(device_index)
+        except Exception as exc:  # pragma: no cover - driver/runtime failures
+            return False, f"unable to query CUDA device: {type(exc).__name__}: {exc}"
+        device_names.append(device_name)
+        if capability < FLASH_ATTENTION_MIN_COMPUTE_CAPABILITY:
+            unsupported.append(
+                f"{device_name} (cuda:{device_index}) has compute capability "
+                f"{capability[0]}.{capability[1]}"
+            )
+    if unsupported:
+        return False, (
+            "; ".join(unsupported)
+            + "; FlashAttention-2 requires compute capability "
+            f"{FLASH_ATTENTION_MIN_COMPUTE_CAPABILITY[0]}."
+            f"{FLASH_ATTENTION_MIN_COMPUTE_CAPABILITY[1]} or newer"
+        )
+    return True, f"flash_attn {version or ''} available on {', '.join(device_names)}".strip()
+
+
+def _warn_flash_fallback(reason):
+    key = str(reason)
+    if key in _FLASH_ATTENTION_WARNINGS:
+        return
+    _FLASH_ATTENTION_WARNINGS.add(key)
+    warnings.warn(
+        "FlashAttention-2 is unavailable; using the regular PyTorch attention "
+        f"fallback. Reason: {reason}. This is expected on Turing/RTX 20-series "
+        "GPUs. The fallback is mathematically equivalent but may be slower; "
+        "patch-level chunking keeps its memory use bounded.",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
+def resolve_attention_backend(backend=None, device=None):
+    """Resolve the attention backend to ``"flash"`` or ``"normal"``.
+
+    ``backend`` accepts:
+      * ``"auto"`` (default, or read from ``SNAP_ATTENTION_BACKEND``): use
+        FlashAttention-2 when the installed package and CUDA device support it,
+        otherwise fall back to regular PyTorch attention.
+      * ``"flash"``: require FlashAttention-2 and raise a clear error when it is
+        unavailable.
+      * ``"normal"``: force the regular PyTorch attention path.
+    """
+    if backend is None:
+        backend = os.environ.get("SNAP_ATTENTION_BACKEND", "auto")
+    if isinstance(backend, bool):
+        backend = "flash" if backend else "normal"
+    backend = str(backend).strip().lower()
+    aliases = {
+        "default": "auto",
+        "flash_attn": "flash",
+        "flash-attn": "flash",
+        "flash_attention": "flash",
+        "torch": "normal",
+        "fallback": "normal",
+    }
+    backend = aliases.get(backend, backend)
+    if backend not in ("auto", "flash", "normal"):
+        raise ValueError(
+            "attention_backend must be one of 'auto', 'flash', or 'normal'; "
+            f"got {backend!r}"
+        )
+
+    available, reason = get_flash_attention_status(device)
+    if backend == "flash":
+        if not available:
+            raise RuntimeError(
+                "FlashAttention-2 was explicitly requested "
+                "(attention_backend='flash' or SNAP_ATTENTION_BACKEND=flash) "
+                f"but is unavailable: {reason}. Use 'auto' or 'normal' to run "
+                "with the PyTorch attention fallback."
+            )
+        return "flash"
+    if backend == "auto":
+        if available:
+            return "flash"
+        _warn_flash_fallback(reason)
+        return "normal"
+    return "normal"
 
 from .serialization import encode
 import pdb
 import copy
 
 # Main change in this code is the use of point.domain instead of point.condition everywhere in the code. 
+
+
+class AutocastSafeSubMConv3d(spconv.SubMConv3d):
+    """SubMConv3d that keeps spconv in FP32 under CUDA autocast.
+
+    spconv 2.3.6 has no FP16 algorithm for some submanifold convolutions on
+    Turing (sm75) and raises "can't find suitable algorithm".  Casting the
+    sparse features back to FP32 for the convolution lets the linear/attention
+    layers use FP16 autocast while keeping the sparse backbone functional.
+    """
+
+    def forward(self, input):
+        features = getattr(input, "features", None)
+        if torch.is_autocast_enabled() and features is not None and features.dtype != torch.float32:
+            input = input.replace_feature(features.float())
+        return super().forward(input)
 
 
 @torch.inference_mode()
@@ -313,6 +478,28 @@ class RPE(torch.nn.Module):
         return out
 
 
+def _attention_chunk_patches(num_patches, num_heads, patch_size, dtype):
+    """Number of patches to process at once in the PyTorch attention fallback.
+
+    The regular attention path materializes (patches, heads, K, K) tensors.  On
+    an 8 GiB Turing card that can require several GiB for a single layer.  We
+    keep the exact same math but process patches in bounded chunks.  Override
+    the budget with ``SNAP_ATTN_CHUNK_BYTES`` (bytes; raise it to trade memory
+    for fewer Python-loop iterations).
+    """
+    try:
+        budget = int(os.environ.get("SNAP_ATTN_CHUNK_BYTES", 256 * 1024 * 1024))
+    except ValueError:
+        budget = 256 * 1024 * 1024
+    budget = max(budget, 1)
+    try:
+        element_size = torch.empty(0, dtype=dtype).element_size()
+    except (TypeError, RuntimeError):
+        element_size = 4
+    bytes_per_patch = max(num_heads * patch_size * patch_size * element_size, 1)
+    return max(1, min(num_patches, budget // bytes_per_patch))
+
+
 class SerializedAttention(PointModule):
     def __init__(
         self,
@@ -338,6 +525,11 @@ class SerializedAttention(PointModule):
         self.upcast_attention = upcast_attention
         self.upcast_softmax = upcast_softmax
         self.enable_rpe = enable_rpe
+        if enable_flash:
+            flash_available, flash_reason = get_flash_attention_status()
+            if not flash_available:
+                _warn_flash_fallback(flash_reason)
+                enable_flash = False
         self.enable_flash = enable_flash
         if enable_flash:
             assert (
@@ -349,9 +541,12 @@ class SerializedAttention(PointModule):
             assert (
                 upcast_softmax is False
             ), "Set upcast_softmax to False when enable Flash Attention"
-            assert flash_attn is not None, "Make sure flash_attn is installed."
+            assert flash_attn is not None, (
+                "FlashAttention-2 was enabled but flash_attn is not available."
+            )
             self.patch_size = patch_size
-            self.attn_drop = attn_drop
+            self.patch_size_max = patch_size
+            self.attn_drop = torch.nn.Dropout(attn_drop)
         else:
             # when disable flash attention, we still don't want to use mask
             # consequently, patch size will auto set to the
@@ -435,7 +630,17 @@ class SerializedAttention(PointModule):
         return point[pad_key], point[unpad_key], point[cu_seqlens_key]
 
     def forward(self, point):
-        if not self.enable_flash:
+        # The model may be constructed before its final device is known (for
+        # example built on CPU then moved, or built while several GPUs are
+        # visible).  Re-check the actual input device so a FlashAttention-2
+        # configuration never calls flash_attn on an unsupported device.
+        use_flash = self.enable_flash
+        if use_flash:
+            flash_available, _ = get_flash_attention_status(point.feat.device)
+            use_flash = flash_available
+        if use_flash:
+            self.patch_size = self.patch_size_max
+        else:
             self.patch_size = min(
                 offset2bincount(point.offset).min().tolist(), self.patch_size_max
             )
@@ -452,7 +657,7 @@ class SerializedAttention(PointModule):
         # padding and reshape feat and batch for serialized point patch
         qkv = self.qkv(point.feat)[order]
 
-        if not self.enable_flash:
+        if not use_flash:
             # encode and reshape qkv: (N', K, 3, H, C') => (3, N', H, K, C')
             q, k, v = (
                 qkv.reshape(-1, K, 3, H, C // H).permute(2, 0, 3, 1, 4).unbind(dim=0)
@@ -461,20 +666,31 @@ class SerializedAttention(PointModule):
             if self.upcast_attention:
                 q = q.float()
                 k = k.float()
-            attn = (q * self.scale) @ k.transpose(-2, -1)  # (N', H, K, K)
-            if self.enable_rpe:
-                attn = attn + self.rpe(self.get_rel_pos(point, order))
-            if self.upcast_softmax:
-                attn = attn.float()
-            attn = self.softmax(attn)
-            attn = self.attn_drop(attn).to(qkv.dtype)
-            feat = (attn @ v).transpose(1, 2).reshape(-1, C)
+            # Process patches in chunks.  This is the same attention math as
+            # before, but avoids materializing the full (N', H, K, K) tensor,
+            # which does not fit in 8 GiB on Turing GPUs for the decoder stages.
+            num_patches = q.shape[0]
+            chunk = _attention_chunk_patches(num_patches, H, K, q.dtype)
+            rpe = self.rpe(self.get_rel_pos(point, order)) if self.enable_rpe else None
+            feat_chunks = []
+            for start in range(0, num_patches, chunk):
+                end = min(start + chunk, num_patches)
+                q_chunk = q[start:end]
+                attn = (q_chunk * self.scale) @ k[start:end].transpose(-2, -1)
+                if rpe is not None:
+                    attn = attn + rpe[start:end]
+                if self.upcast_softmax:
+                    attn = attn.float()
+                attn = self.softmax(attn)
+                attn = self.attn_drop(attn).to(qkv.dtype)
+                feat_chunks.append((attn @ v[start:end]).transpose(1, 2))
+            feat = torch.cat(feat_chunks, dim=0).reshape(-1, C)
         else:
             feat = flash_attn.flash_attn_varlen_qkvpacked_func(
                 qkv.half().reshape(-1, 3, H, C // H),
                 cu_seqlens,
                 max_seqlen=self.patch_size,
-                dropout_p=self.attn_drop if self.training else 0,
+                dropout_p=self.attn_drop.p if self.training else 0,
                 softmax_scale=self.scale,
             ).reshape(-1, C)
             feat = feat.to(qkv.dtype)
@@ -540,7 +756,7 @@ class Block(PointModule):
         self.pre_norm = pre_norm
 
         self.cpe = PointSequential(
-            spconv.SubMConv3d(
+            AutocastSafeSubMConv3d(
                 channels,
                 channels,
                 kernel_size=3,
@@ -762,7 +978,7 @@ class Embedding(PointModule):
         # TODO: check remove spconv
         # print("in_channels:", in_channels)
         self.stem = PointSequential(
-            conv=spconv.SubMConv3d(
+            conv=AutocastSafeSubMConv3d(
                 in_channels,
                 embed_channels,
                 kernel_size=5,
@@ -821,6 +1037,13 @@ class PointTransformerV3(PointModule):
         return_mid_points=False,
     ):
         super().__init__()
+        if enable_flash:
+            flash_available, flash_reason = get_flash_attention_status()
+            if not flash_available:
+                _warn_flash_fallback(flash_reason)
+                enable_flash = False
+        self.enable_flash = enable_flash
+        self.attention_backend = "flash" if enable_flash else "normal"
         self.num_stages = len(enc_depths)
         self.order = [order] if isinstance(order, str) else order
         self.cls_mode = cls_mode

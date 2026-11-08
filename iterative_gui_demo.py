@@ -11,8 +11,6 @@ import logging
 
 # --- (Scientific Computing and Data Handling Imports) ---
 import numpy as np
-import open3d as o3d  # For 3D point cloud processing
-import pandas as pd
 import pyvista as pv   # For 3D visualization and plotting
 
 # --- (Deep Learning Imports) ---
@@ -24,6 +22,15 @@ import clip             # OpenAI's CLIP model for text and image embeddings
 from src.snap import SNAP
 from utils.torch_helpers import all_to_device
 from datasets.demo import DemoDatset
+from pointcloud_loader import load_point_cloud as load_point_cloud_file
+
+# Single source of truth for the inference precision policy.  The Python demo
+# exposes the same helpers, so both entry points validate devices identically.
+from python_demo import (
+    PRECISION_CHOICES,
+    precision_autocast,
+    resolve_precision,
+)
 
 # --- (GUI and Plotting Imports) ---
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -49,6 +56,11 @@ def get_args_parser():
     parser.add_argument('--grid_size', default=0.05, type=float, help="Voxel grid size for initial point cloud processing.")
     parser.add_argument('--seed', default=42, type=int, help="Random seed for reproducibility.")
     parser.add_argument('--num_object_chunk', default=16, type=int, help="Batch size for processing prompt points during inference.")
+    parser.add_argument('--precision', default='fp32', choices=PRECISION_CHOICES,
+                        help="Inference precision. 'fp16' enables CUDA autocast (the model stays in FP32); "
+                             "it requires a CUDA GPU and is rejected on CPU.")
+    parser.add_argument('--trust_pickle', action=argparse.BooleanOptionalAction, default=True,
+                        help="Allow .pth/.pkl inputs to be unpickled. These formats can execute arbitrary code.")
     return parser
 
 def non_maximum_suppression_masks(masks, scores, iou_threshold):
@@ -104,48 +116,18 @@ def voxel_downsample(points, voxel_size):
     return points[sorted_indices[first_occurrence_indices]]
 
 class PointCloudData:
-    """A class to handle loading point cloud data from various file formats."""
-    
+    """Thin wrapper around :func:`pointcloud_loader.load_point_cloud`.
+
+    The GUI historically had its own loader that silently ignored malformed
+    inputs and did not support STPLS3D ``.pth`` files.  Both demos now share a
+    single, validated implementation.
+    """
+
+    def __init__(self, trust_pickle: bool = True):
+        self.trust_pickle = trust_pickle
+
     def load_point_cloud(self, filename):
-        """
-        Loads a point cloud from a file, supporting multiple formats.
-        """
-        data = {}
-        if filename.lower().endswith(('.ply', '.pcd')):
-            pcd = o3d.io.read_point_cloud(filename)
-        elif filename.lower().endswith('.pcd.bin'):
-            pcdata = np.fromfile(filename, dtype=np.float32).reshape(-1, 5)
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(pcdata[:, :3])
-            data["intensity"] = pcdata[:, 3].reshape(-1, 1) / 255.0
-        elif filename.lower().endswith('.bin'):
-            pcdata = np.fromfile(filename, dtype=np.float32).reshape(-1, 4)
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(pcdata[:, :3])
-            data["intensity"] = pcdata[:, 3].reshape(-1, 1)
-        elif filename.lower().endswith('.pkl'):
-            pcdata = pd.read_pickle(filename)
-            valid_idxs = np.where(pcdata.d == 0)[0]
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(np.asarray(pcdata.values[valid_idxs][:, :3]))
-            data['intensity'] = np.expand_dims(np.asarray(pcdata.values[valid_idxs][:, 3]) / 255.0, 1)
-        elif os.path.isdir(filename):
-            coords = np.load(os.path.join(filename, "coord.npy"))
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(coords)
-            if os.path.exists(os.path.join(filename, "color.npy")):
-                pcd.colors = o3d.utility.Vector3dVector(np.load(os.path.join(filename, "color.npy")))
-            if os.path.exists(os.path.join(filename, "normal.npy")):
-                pcd.normals = o3d.utility.Vector3dVector(np.load(os.path.join(filename, "normal.npy")))
-        else:
-            raise ValueError("Unsupported file format.")
-            
-        data["coord"] = np.asarray(pcd.points)
-        if pcd.has_colors():
-            data["color"] = np.asarray(pcd.colors)
-        if pcd.has_normals():
-            data["normal"] = np.asarray(pcd.normals)
-        return data
+        return load_point_cloud_file(filename, trust_pickle=self.trust_pickle)
 
 # ==============================================================================
 # 3. SEGMENTATION MODEL WRAPPER
@@ -157,6 +139,9 @@ class SegmentationModel:
     def __init__(self, args, checkpoint_path=None, domain="Outdoor", grid_size=0.05):
         self.args = args
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Validate before allocating the model so an unsupported request fails
+        # immediately with a clear message.
+        self.precision = resolve_precision(getattr(args, "precision", "fp32"), self.device)
         self.domain = domain
         self.dataset = DemoDatset(domain=self.domain)
         
@@ -179,14 +164,17 @@ class SegmentationModel:
     def extract_backbone_features(self, data):
         data = all_to_device(data, self.device)
         with torch.no_grad():
+            # Input feature construction remains FP32; only the backbone is
+            # run under the selected precision.
             data = self.model.run_input_encoder(data)
-            self.point_features, _ = self.model.run_backbone(data)
+            with precision_autocast(self.device, self.precision):
+                self.point_features, _ = self.model.run_backbone(data)
     
     def get_text_label(self, clip_token, pred_token, labels):
         clip_token = F.normalize(clip_token.to(torch.float32), p=2, dim=1)
-        pred_token = F.normalize(pred_token, p=2, dim=1)
+        pred_token = F.normalize(pred_token.to(torch.float32), p=2, dim=1)
         
-        logits = pred_token @ clip_token.T
+        logits = (pred_token @ clip_token.T).float()
         pred_labels = torch.argmax(logits, dim=1)
         
         return labels[pred_labels], logits[0, pred_labels[0]].detach().cpu().numpy()
@@ -233,12 +221,13 @@ class SegmentationModel:
     def find_best_mask_from_text(self, cached_tokens, text_prompt):
         if not cached_tokens: return -1
         
-        with torch.no_grad():
+        with torch.no_grad(), precision_autocast(self.device, self.precision):
             txt_in = clip.tokenize(text_prompt).to(self.device)
-            prompt_feats = F.normalize(self.clip_model.encode_text(txt_in).to(torch.float32), p=2, dim=-1)
+            prompt_feats = self.clip_model.encode_text(txt_in).to(torch.float32)
+        prompt_feats = F.normalize(prompt_feats, p=2, dim=-1)
         
-        mask_tokens = F.normalize(torch.stack(cached_tokens).to(self.device), p=2, dim=-1)
-        scores = torch.mm(mask_tokens, prompt_feats.T)
+        mask_tokens = F.normalize(torch.stack(cached_tokens).to(self.device, dtype=torch.float32), p=2, dim=-1)
+        scores = (torch.mm(mask_tokens, prompt_feats.T)).float()
         
         best_idx = torch.argmax(scores)
         print(f"Best mask #{best_idx.item()} with score {scores[best_idx].item():.4f}")
@@ -254,8 +243,8 @@ class SegmentationModel:
             prompt_points_tensor = prompt_points
 
         txt_vocab = torch.cat([clip.tokenize(f"a point cloud of a {c}") for c in self.dataset.labels]).to(self.device)
-        with torch.no_grad():
-            txt_feats_vocab = self.clip_model.encode_text(txt_vocab)
+        with torch.no_grad(), precision_autocast(self.device, self.precision):
+            txt_feats_vocab = self.clip_model.encode_text(txt_vocab).float()
             
         all_logits, all_txt, all_iou = [], [], []
         num_prompts, chunk_size = prompt_points_tensor.shape[0], self.args.num_object_chunk
@@ -266,10 +255,12 @@ class SegmentationModel:
                 data_dict = {**data, "point": chunk, "point_offset": [chunk.shape[0]]}
                 data_dict = all_to_device(data_dict, self.device)
                 
-                logits, txt, iou, _, _, _, _ = self.model.run_mask_decoder(self.point_features, data_dict)
-                all_logits.append(logits[0])
-                all_txt.append(txt[0])
-                all_iou.append(iou[0])
+                with precision_autocast(self.device, self.precision):
+                    logits, txt, iou, _, _, _, _ = self.model.run_mask_decoder(self.point_features, data_dict)
+                # Post-processing and cached tokens are always FP32.
+                all_logits.append(logits[0].float())
+                all_txt.append(txt[0].float())
+                all_iou.append(iou[0].float())
         
         if not all_logits: return [], [], []
         
@@ -578,12 +569,14 @@ class InteractivePlotter:
             return
 
         self.cached_masks = masks
-        self.cached_tokens = [t.cpu() for t in tokens]
+        self.cached_tokens = [t.detach().float().cpu() for t in tokens]
         print(f"Cached {len(self.cached_masks)} masks for text search.")
 
         txt_vocab = torch.cat([clip.tokenize(f"a point cloud of a {c}") for c in self.model.dataset.labels]).to(self.model.device)
-        with torch.no_grad():
-            txt_feats_vocab = self.model.clip_model.encode_text(txt_vocab)
+        with torch.no_grad(), precision_autocast(
+            self.model.device, getattr(self.model, "precision", "fp32")
+        ):
+            txt_feats_vocab = self.model.clip_model.encode_text(txt_vocab).float()
         text_labels = [self.model.get_text_label(txt_feats_vocab, t.unsqueeze(0), self.model.dataset.labels)[0] for t in tokens]
         
         self.visualize_masks_and_labels(masks, text_labels, iou_out, prompt_points)
@@ -651,7 +644,7 @@ def main(args):
     app = QApplication(sys.argv)
     app.setStyleSheet(MODERN_STYLESHEET)
     
-    point_cloud_loader = PointCloudData()
+    point_cloud_loader = PointCloudData(trust_pickle=args.trust_pickle)
     point_cloud_data = point_cloud_loader.load_point_cloud(args.pc_path)
     
     window = MainWindow(args, point_cloud_data)
